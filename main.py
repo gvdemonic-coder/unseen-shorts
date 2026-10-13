@@ -128,22 +128,29 @@ def _gemini_models(key):
 
 
 def gen_script(used):
+    """Try every available Gemini model; if Google is busy (503) wait and go round again."""
     import requests
     key = os.environ["GEMINI_API_KEY"]
+    models = _gemini_models(key)
     last_err = None
-    for model in _gemini_models(key):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        for attempt in range(2):
+    for rnd in range(5):
+        for model in list(models):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             body = {
                 "contents": [{"parts": [{"text": PROMPT.format(used=" | ".join(used) or "none yet")}]}],
                 "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0},
             }
             try:
                 r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
-                if r.status_code in (403, 404, 429):
+                if r.status_code == 404:
+                    models.remove(model)
+                    last_err = f"{model}: HTTP 404"
+                    print(f"round {rnd + 1}: {model} not found, dropping it")
+                    continue
+                if r.status_code in (403, 429, 500, 502, 503, 504):
                     last_err = f"{model}: HTTP {r.status_code}"
-                    print(f"{model} not usable ({r.status_code}), trying next model")
-                    break
+                    print(f"round {rnd + 1}: {model} busy/unavailable ({r.status_code})")
+                    continue
                 r.raise_for_status()
                 text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                 data = json.loads(text)
@@ -155,8 +162,12 @@ def gen_script(used):
                 return data
             except Exception as e:
                 last_err = e
-                print(f"{model} attempt {attempt + 1} failed: {e}")
-                time.sleep(5)
+                print(f"round {rnd + 1}: {model} failed: {e}")
+        if not models:
+            break
+        wait = 30 * (rnd + 1)
+        print(f"all models busy, waiting {wait}s before next round")
+        time.sleep(wait)
     raise RuntimeError(f"could not generate script: {last_err}")
 
 
