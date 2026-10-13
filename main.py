@@ -92,31 +92,71 @@ Return ONLY JSON:
  "tags": ["..."], "scenes": [{{"narration_hindi": "...", "image_prompt": "..."}}]}}"""
 
 
+def _gemini_models(key):
+    """Ask Google which models this key can use; newest stable Flash first."""
+    import re
+    import requests
+    names = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                         headers={"x-goog-api-key": key}, timeout=60)
+        r.raise_for_status()
+        for m in r.json().get("models", []):
+            if "generateContent" in m.get("supportedGenerationMethods", []):
+                names.append(m["name"].split("/", 1)[1])
+    except Exception as e:
+        print(f"model list failed: {e}")
+
+    def ver(n):
+        m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return float(m.group(1)) if m else 0.0
+
+    bad = ("lite", "image", "tts", "live", "audio", "embedding", "robotics", "computer", "vision", "learnlm", "gemma")
+    flash = [n for n in names if "flash" in n and not any(b in n for b in bad)]
+    stable = [n for n in flash if not any(x in n for x in ("preview", "exp"))]
+    other = [n for n in flash if n not in stable]
+    ordered = sorted(stable, key=ver, reverse=True) + sorted(other, key=ver, reverse=True)
+    forced = os.environ.get("GEMINI_MODEL")
+    out = ([forced] if forced else []) + ordered + ["gemini-flash-latest", "gemini-2.5-flash"]
+    seen, res = set(), []
+    for n in out:
+        if n not in seen:
+            seen.add(n)
+            res.append(n)
+    print("models to try:", res[:6])
+    return res[:6]
+
+
 def gen_script(used):
     import requests
     key = os.environ["GEMINI_API_KEY"]
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     last_err = None
-    for attempt in range(4):
-        body = {
-            "contents": [{"parts": [{"text": PROMPT.format(used=" | ".join(used) or "none yet")}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0},
-        }
-        try:
-            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
-            r.raise_for_status()
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            data = json.loads(text)
-            assert data["topic"] and data["source_text"] and data["title"]
-            assert len(data["scenes"]) >= 5
-            if data["topic"].strip().lower() in [u.strip().lower() for u in used]:
-                raise ValueError("topic already used")
-            return data
-        except Exception as e:
-            last_err = e
-            print(f"script attempt {attempt + 1} failed: {e}")
-            time.sleep(5)
+    for model in _gemini_models(key):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(2):
+            body = {
+                "contents": [{"parts": [{"text": PROMPT.format(used=" | ".join(used) or "none yet")}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0},
+            }
+            try:
+                r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
+                if r.status_code in (403, 404, 429):
+                    last_err = f"{model}: HTTP {r.status_code}"
+                    print(f"{model} not usable ({r.status_code}), trying next model")
+                    break
+                r.raise_for_status()
+                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                data = json.loads(text)
+                assert data["topic"] and data["source_text"] and data["title"]
+                assert len(data["scenes"]) >= 5
+                if data["topic"].strip().lower() in [u.strip().lower() for u in used]:
+                    raise ValueError("topic already used")
+                print(f"script made with {model}")
+                return data
+            except Exception as e:
+                last_err = e
+                print(f"{model} attempt {attempt + 1} failed: {e}")
+                time.sleep(5)
     raise RuntimeError(f"could not generate script: {last_err}")
 
 
