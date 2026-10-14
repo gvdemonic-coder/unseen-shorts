@@ -28,6 +28,10 @@ FPS = 30
 PAD = 0.35  # seconds of silence after each scene's narration
 CAPTION_FONT = os.environ.get("CAPTION_FONT", "Noto Sans Devanagari")
 VOICE = os.environ.get("TTS_VOICE", "hi-IN-MadhurNeural")
+GEMINI_VOICE = os.environ.get("GEMINI_VOICE", "Charon")
+_ALL_MODELS = []                      # every model name this Gemini key can use
+_STATS = {"voice_gemini": 0, "voice_other": 0, "img_ai": 0, "img_reused": 0, "img_plain": 0}
+_STATE = {"img_gemini_off": False, "last_image": None}
 
 
 # ----------------------------------------------------------------- helpers
@@ -75,21 +79,55 @@ def save_row(topic, source, title, link, status):
 
 
 # ----------------------------------------------------------------- script
-PROMPT = """You are a researcher and Hindi storyteller for a YouTube Shorts channel "Unseen Mythology".
+CATEGORIES = [
+    "a little-known story of Lord Krishna, Lord Shiva (Mahadev), Lord Vishnu's avatars or Devi from the Puranas, Mahabharata or Ramayana",
+    "asuras, rakshasas and demon kings of Hindu and Buddhist texts: their boons, their pride and their downfall",
+    "a legendary sea monster or primordial beast from world mythology (Leviathan, Kraken, Jormungandr, Tiamat, Makara and similar)",
+    "ancient Egypt: gods, mummies, pharaoh curses, the Book of the Dead and the journey through the afterlife",
+    "a rare mythological creature seen in almost no videos (Nagas, Yokai, Wendigo, Basilisk, Simurgh, Chimera, Rakshasa-like spirits)",
+    "Greek, Roman or Norse mythology: a forgotten monster, god or doomed hero",
+    "ancient Mesopotamian, Persian and Abrahamic-tradition legends: Gilgamesh, Behemoth, Jinn, Nephilim, Anunnaki",
+    "Aztec, Maya, Inca, African, Slavic or Celtic legends: underworld rulers, spirits and strange creatures",
+]
 
-Pick ONE lesser-known story from Indian mythology, the Puranas, Mahabharata, Ramayana or other ancient texts.
+STYLE = ("epic cinematic digital painting, dramatic volumetric lighting, rich deep colors, highly detailed, "
+         "sharp focus, 9:16 vertical composition, no text, no letters, no watermark")
+
+PROMPT = """You are a world-class researcher and a gripping Hindi storyteller for the YouTube Shorts channel "Unseen Mythology".
+The channel covers mythology and ancient legends from ALL cultures: Indian gods and the Puranas, demons and creatures,
+sea monsters like Leviathan, ancient Egypt and mummies, rare mythical beasts, and forgotten legends of the world.
+
+TODAY'S THEME: {category}
+Pick ONE specific story or being inside this theme that most people have never heard of. It must be surprising.
 Do NOT pick any of these already used topics: {used}
 
-Rules:
-- Name the real source text (e.g. "Skanda Purana", "Vana Parva"). Only cite a source you are confident about; otherwise choose another story.
-- Write a ~60 second Hindi (Devanagari) storytelling script in exactly 8 scenes. Each scene narration is 16-20 Hindi words.
-- Scene 1 must open with a mystery hook (a question or surprising line) in the first 3 seconds.
-- Tone: calm, dramatic, respectful. Nothing that mocks any deity or community.
-- For every scene give an English image_prompt: cinematic, painterly Indian art style, vertical composition, respectful, no text in image, no gore.
+Truth rules:
+- Name the real source (text, tablet, papyrus, scripture or folklore collection). Cite only what you are confident about; otherwise pick another story.
+- Separate what the source says from later folklore. Never invent facts. Treat every deity and religion with respect, never mock any faith.
+
+Script rules (all narration in Hindi, Devanagari script):
+- Exactly 10 scenes. Each scene narration = 12 to 16 Hindi words. Total about 130 to 150 words (about 55 to 60 seconds when spoken).
+- It is ONE continuous spoken story. Sentences flow from scene to scene, no scene feels like a separate paragraph.
+- Scene 1 is a killer hook: a startling question or shocking fact that makes people stop scrolling. Do NOT start with a greeting.
+- Then build tension scene by scene, give one jaw-dropping fact, a twist near the end, and finish with one powerful closing line that stays in the mind.
+- Plain, powerful spoken Hindi. Short sentences. No English words except proper names written in Devanagari. Write numbers in words.
+- Use only Devanagari letters and these marks: comma, question mark, exclamation mark, danda. No quotes, no dashes, no ellipsis, no brackets, no emoji.
+
+Image rules (this matters a lot):
+- "visual_style": ONE English sentence describing the look and the main character(s) so every image stays consistent (age, clothing, skin, key features, colors, era).
+- For each scene give an English "image_prompt" of 35 to 55 words: the subject, the action, the environment, the lighting, the camera angle and the mood. Repeat the main character's key look from visual_style in every scene where they appear.
+- Describe real, concrete, cinematic scenes. No text or letters in the image, no gore, no nudity. Show deities with dignity.
 
 Return ONLY JSON:
-{{"topic": "...", "source_text": "...", "title": "Hindi title max 70 chars", "description": "short Hindi description",
- "tags": ["..."], "scenes": [{{"narration_hindi": "...", "image_prompt": "..."}}]}}"""
+{"topic": "...", "category": "...", "source_text": "...", "title": "Hindi curiosity title, max 70 chars", "description": "2 short Hindi lines",
+ "tags": ["8 to 12 tags mixing Hindi and English"], "visual_style": "...",
+ "scenes": [{"narration_hindi": "...", "image_prompt": "..."}]}"""
+
+
+def build_prompt(used):
+    category = CATEGORIES[len(used) % len(CATEGORIES)]
+    return (PROMPT.replace("{category}", category)
+                  .replace("{used}", " | ".join(used[-60:]) or "none yet"))
 
 
 def _gemini_models(key):
@@ -104,6 +142,7 @@ def _gemini_models(key):
         for m in r.json().get("models", []):
             if "generateContent" in m.get("supportedGenerationMethods", []):
                 names.append(m["name"].split("/", 1)[1])
+        _ALL_MODELS[:] = names
     except Exception as e:
         print(f"model list failed: {e}")
 
@@ -137,7 +176,7 @@ def gen_script(used):
         for model in list(models):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             body = {
-                "contents": [{"parts": [{"text": PROMPT.format(used=" | ".join(used) or "none yet")}]}],
+                "contents": [{"parts": [{"text": build_prompt(used)}]}],
                 "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0},
             }
             try:
@@ -155,7 +194,9 @@ def gen_script(used):
                 text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                 data = json.loads(text)
                 assert data["topic"] and data["source_text"] and data["title"]
-                assert len(data["scenes"]) >= 5
+                assert 7 <= len(data["scenes"]) <= 12, "wrong number of scenes"
+                words = sum(len(x["narration_hindi"].split()) for x in data["scenes"])
+                assert 90 <= words <= 220, f"script has {words} words"
                 if data["topic"].strip().lower() in [u.strip().lower() for u in used]:
                     raise ValueError("topic already used")
                 print(f"script made with {model}")
@@ -177,7 +218,59 @@ async def _edge_tts(text, path):
     await edge_tts.Communicate(text, VOICE, rate="-5%").save(str(path))
 
 
+def _gemini_tts(text, path):
+    """Natural Hindi voice from Gemini (free tier). Returns True on success."""
+    import base64
+    import re as _re
+    import requests
+    import wave
+    key = os.environ.get("GEMINI_API_KEY")
+    cands = [n for n in _ALL_MODELS if "tts" in n]
+    cands.sort(key=lambda n: ("preview" in n, n))
+    cands = (cands or ["gemini-2.5-flash-preview-tts"])[:2]
+    prompt = ("Say in a deep, calm, confident documentary narrator voice, at a steady natural pace, "
+              "in one smooth continuous flow with no long pauses and no hesitation, "
+              "with dramatic emphasis on the key moments: " + text)
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_VOICE}}}}}
+    for model in cands:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(4):
+            try:
+                r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=180)
+                if r.status_code in (400, 403, 404):
+                    print(f"gemini tts {model}: HTTP {r.status_code}, skipping model")
+                    break
+                if r.status_code in (429, 500, 502, 503, 504):
+                    wait = 15 * (attempt + 1)
+                    print(f"gemini tts {model}: HTTP {r.status_code}, waiting {wait}s")
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                part = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
+                pcm = base64.b64decode(part["data"])
+                m = _re.search(r"rate=(\d+)", part.get("mimeType", ""))
+                rate = int(m.group(1)) if m else 24000
+                if len(pcm) < 4000:
+                    raise ValueError("audio too short")
+                with wave.open(str(path), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(rate)
+                    w.writeframes(pcm)
+                return True
+            except Exception as e:
+                print(f"gemini tts {model} attempt {attempt + 1} failed: {e}")
+                time.sleep(5)
+    return False
+
+
 def make_voice(text, path):
+    if _gemini_tts(text, path):
+        _STATS["voice_gemini"] += 1
+        return
+    _STATS["voice_other"] += 1
     try:
         asyncio.run(_edge_tts(text, path))
         if path.stat().st_size > 1000:
@@ -195,22 +288,75 @@ def make_gradient(path, idx):
          "-frames:v", "1", str(path)])
 
 
+def _finish_image(raw_bytes, path):
+    """Save, crop the bottom strip (removes any corner watermark) and fit to 1080x1920."""
+    tmp = path.with_suffix(".raw")
+    tmp.write_bytes(raw_bytes)
+    run(["ffmpeg", "-y", "-i", str(tmp), "-vf",
+         "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+         "crop=iw:ih*0.93:0:0,scale=1080:1920", "-frames:v", "1", str(path)])
+    tmp.unlink(missing_ok=True)
+
+
+def _gemini_image(prompt, path):
+    import base64
+    import requests
+    key = os.environ.get("GEMINI_API_KEY")
+    cands = [n for n in _ALL_MODELS if "image" in n and "flash" in n]
+    cands.sort(key=lambda n: ("preview" in n, n))
+    for model in cands[:2]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        body = {"contents": [{"parts": [{"text": prompt + ". Vertical 9:16 portrait composition."}]}],
+                "generationConfig": {"responseModalities": ["IMAGE"]}}
+        try:
+            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=180)
+            if r.status_code != 200:
+                print(f"gemini image {model}: HTTP {r.status_code}")
+                continue
+            for part in r.json()["candidates"][0]["content"]["parts"]:
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline:
+                    data = base64.b64decode(inline["data"])
+                    if len(data) > 20000:
+                        _finish_image(data, path)
+                        return True
+        except Exception as e:
+            print(f"gemini image {model} failed: {e}")
+    return False
+
+
 def make_image(prompt, path, idx):
     import requests
-    for attempt in range(3):
+    if not _STATE["img_gemini_off"]:
+        if _gemini_image(prompt, path):
+            _STATS["img_ai"] += 1
+            _STATE["last_image"] = path
+            return
+        _STATE["img_gemini_off"] = True      # not available on this key: do not retry every scene
+    for attempt in range(5):
         try:
             seed = random.randint(1, 10**6)
             url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt)
-                   + f"?width=1080&height=1920&nologo=true&seed={seed}")
-            r = requests.get(url, timeout=120)
+                   + f"?width=864&height=1536&nologo=true&model=flux&enhance=false&seed={seed}")
+            r = requests.get(url, timeout=150)
             if r.status_code == 200 and len(r.content) > 20000 and r.headers.get("content-type", "").startswith("image"):
-                path.write_bytes(r.content)
+                _finish_image(r.content, path)
+                _STATS["img_ai"] += 1
+                _STATE["last_image"] = path
                 return
+            print(f"image attempt {attempt + 1}: HTTP {r.status_code}")
         except Exception as e:
             print(f"image attempt {attempt + 1} failed: {e}")
-        time.sleep(8)
+        time.sleep(10 * (attempt + 1))
+    last = _STATE["last_image"]
+    if last and last.exists():
+        print(f"scene {idx + 1}: reusing previous scene image")
+        path.write_bytes(last.read_bytes())
+        _STATS["img_reused"] += 1
+        return
     print(f"scene {idx + 1}: using gradient fallback image")
     make_gradient(path, idx)
+    _STATS["img_plain"] += 1
 
 
 # ----------------------------------------------------------------- assembly
@@ -227,60 +373,122 @@ def chunk_words(text, n=4):
     return [" ".join(words[i:i + n]) for i in range(0, len(words), n)] or [text]
 
 
-def build_video(scenes, voice_files, image_files):
-    """scenes: list of dicts with narration_hindi. Returns path of final.mp4 and thumb.jpg."""
-    clips, wavs, srt_lines, t0, counter = [], [], [], 0.0, 1
-    for i, sc in enumerate(scenes):
-        wav = OUT / f"voice_{i}.wav"
-        run(["ffmpeg", "-y", "-i", str(voice_files[i]), "-ar", "44100", "-ac", "2",
-             "-af", f"apad=pad_dur={PAD}", str(wav)])
-        dur = probe_duration(wav)
-        speech = max(dur - PAD, 0.5)
-        wavs.append(wav)
+XF = 0.5        # cross-dissolve between scenes (seconds)
+END_PAD = 0.9   # silence after the last word
 
-        frames = int(dur * FPS) + 1
-        zoom_in = i % 2 == 0
-        z = "min(zoom+0.0007,1.18)" if zoom_in else "if(eq(on,0),1.18,max(zoom-0.0007,1.0))"
+
+def process_voice(raw, out):
+    """One continuous narration: trim long pauses, even out loudness, add a short tail."""
+    run(["ffmpeg", "-y", "-i", str(raw), "-ar", "44100", "-ac", "2", "-af",
+         "silenceremove=start_periods=1:start_threshold=-45dB:stop_periods=-1:stop_duration=0.45:"
+         "stop_threshold=-45dB:stop_silence=0.18,loudnorm=I=-16:TP=-1.5:LRA=11,"
+         f"apad=pad_dur={END_PAD}", str(out)])
+    return out
+
+
+def silence_mids(path):
+    r = subprocess.run(["ffmpeg", "-i", str(path), "-af", "silencedetect=noise=-38dB:d=0.12", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", r.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", r.stderr)]
+    return [(a + b) / 2 for a, b in zip(starts, ends)]
+
+
+def plan_timeline(scenes, speech_len, total_len, mids):
+    """Spread caption chunks over the narration and snap them to the real pauses in the audio."""
+    chunks = []
+    for i, sc in enumerate(scenes):
+        for c in chunk_words(sc["narration_hindi"], 4):
+            chunks.append((i, c))
+    weights = [max(len(c.replace(" ", "")), 1) for _, c in chunks]
+    total_w, t, bounds = sum(weights), 0.0, [0.0]
+    for w in weights:
+        t += speech_len * w / total_w
+        bounds.append(t)
+    for k in range(1, len(bounds) - 1):
+        tol = 1.2 if chunks[k - 1][0] != chunks[k][0] else 0.6
+        near = min(mids, key=lambda m: abs(m - bounds[k]), default=None)
+        if near is not None and abs(near - bounds[k]) <= tol:
+            bounds[k] = near
+    for k in range(1, len(bounds)):
+        bounds[k] = max(bounds[k], bounds[k - 1] + 0.25)
+    caps = [(bounds[k], bounds[k + 1], chunks[k][1]) for k in range(len(chunks))]
+    starts = {}
+    for k, (i, _) in enumerate(chunks):
+        starts.setdefault(i, bounds[k])
+    scene_starts = [starts[i] for i in range(len(scenes))] + [total_len]
+    scene_starts[0] = 0.0
+    durs = [max(scene_starts[i + 1] - scene_starts[i], 1.5) for i in range(len(scenes))]
+    return caps, durs
+
+
+def build_video(scenes, voice_raw, image_files):
+    """scenes: dicts with narration_hindi. One continuous voice file. Returns final.mp4 and thumb.jpg."""
+    voice = process_voice(voice_raw, OUT / "voice.wav")
+    total = probe_duration(voice)
+    speech_len = max(total - END_PAD, 1.0)
+    caps, durs = plan_timeline(scenes, speech_len, total, silence_mids(voice))
+
+    n = len(scenes)
+    clips = []
+    for i in range(n):
+        length = durs[i] + XF
+        frames = int(length * FPS) + 2
+        mode = i % 4
+        if mode == 0:
+            zp = f"z='min(zoom+0.0006,1.2)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        elif mode == 1:
+            zp = f"z='if(eq(on,0),1.2,max(zoom-0.0006,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        elif mode == 2:
+            zp = f"z=1.15:x='(iw-iw/zoom)*on/{frames}':y='ih/2-(ih/zoom/2)'"
+        else:
+            zp = f"z=1.15:x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)'"
         vf = (f"scale=1296:2304:force_original_aspect_ratio=increase,crop=1296:2304,"
-              f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps={FPS},"
-              f"format=yuv420p")
+              f"zoompan={zp}:d={frames}:s=1080x1920:fps={FPS},"
+              "eq=contrast=1.06:saturation=1.12,vignette=angle=PI/5,noise=alls=5:allf=t,format=yuv420p")
         clip = OUT / f"clip_{i}.mp4"
-        run(["ffmpeg", "-y", "-i", str(image_files[i]), "-vf", vf, "-t", f"{dur:.3f}",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", str(FPS), str(clip)])
+        run(["ffmpeg", "-y", "-i", str(image_files[i]), "-vf", vf, "-t", f"{length:.3f}",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-r", str(FPS), str(clip)])
         clips.append(clip)
 
-        chunks = chunk_words(sc["narration_hindi"])
-        total_w = sum(len(c.split()) for c in chunks)
-        t = t0
-        for c in chunks:
-            d = speech * len(c.split()) / total_w
-            srt_lines += [str(counter), f"{srt_time(t)} --> {srt_time(t + d)}", c, ""]
-            counter += 1
-            t += d
-        t0 += dur
-
-    (OUT / "captions.srt").write_text("\n".join(srt_lines), encoding="utf-8")
-    (OUT / "clips.txt").write_text("".join(f"file '{c.name}'\n" for c in clips))
-    (OUT / "voices.txt").write_text("".join(f"file '{w.name}'\n" for w in wavs))
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "clips.txt", "-c", "copy", "video.mp4"], cwd=OUT)
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "voices.txt", "-c", "copy", "voice.wav"], cwd=OUT)
+    srt, counter = [], 1
+    for a, b, text in caps:
+        srt += [str(counter), f"{srt_time(a)} --> {srt_time(b)}", text, ""]
+        counter += 1
+    (OUT / "captions.srt").write_text("\n".join(srt), encoding="utf-8")
 
     bgm = BGM
     if not bgm.exists():
         bgm = OUT / "bgm_synth.mp3"
-        run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=110:duration=90",
-             "-f", "lavfi", "-i", "sine=frequency=165:duration=90",
-             "-f", "lavfi", "-i", "sine=frequency=220:duration=90",
-             "-filter_complex", "[0][1][2]amix=inputs=3:normalize=0,lowpass=f=500,tremolo=f=0.2:d=0.5,volume=1.5",
+        run(["ffmpeg", "-y",
+             "-f", "lavfi", "-i", "anoisesrc=color=brown:duration=120:amplitude=0.5",
+             "-f", "lavfi", "-i", "sine=frequency=55:duration=120",
+             "-f", "lavfi", "-i", "sine=frequency=82.4:duration=120",
+             "-f", "lavfi", "-i", "sine=frequency=110:duration=120",
+             "-filter_complex",
+             "[0]lowpass=f=260,volume=0.9[n];[1][2][3]amix=inputs=3:normalize=0,tremolo=f=0.15:d=0.6,volume=1.2[d];"
+             "[n][d]amix=inputs=2:normalize=0,aecho=0.8:0.6:700:0.35,lowpass=f=1200,volume=1.5",
              str(bgm)])
 
-    style = (f"FontName={CAPTION_FONT},FontSize=14,Bold=1,PrimaryColour=&H00FFFFFF,"
-             "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Alignment=2,MarginV=200")
-    fc = (f"[0:v]subtitles=captions.srt:force_style='{style}'[v];"
-          "[2:a]volume=0.12[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[a]")
-    run(["ffmpeg", "-y", "-i", "video.mp4", "-i", "voice.wav", "-stream_loop", "-1", "-i", str(bgm),
-         "-filter_complex", fc, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast",
-         "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", "final.mp4"], cwd=OUT)
+    inputs = []
+    for c in clips:
+        inputs += ["-i", str(c.name)]
+    inputs += ["-i", "voice.wav", "-stream_loop", "-1", "-i", str(bgm)]
+    vi, ai = n, n + 1
+    parts, acc, offset = [], "[0:v]", 0.0
+    for k in range(1, n):
+        offset += durs[k - 1]
+        out_l = f"[x{k}]"
+        parts.append(f"{acc}[{k}:v]xfade=transition=dissolve:duration={XF}:offset={offset:.3f}{out_l}")
+        acc = out_l
+    style = (f"FontName={CAPTION_FONT},FontSize=15,Bold=1,PrimaryColour=&H00FFFFFF,"
+             "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Alignment=2,MarginV=220")
+    parts.append(f"{acc}subtitles=captions.srt:force_style='{style}'[v]")
+    parts.append(f"[{ai + 0}:a]volume=0.10[bg]")
+    parts.append(f"[{vi}:a][bg]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[a]")
+    run(["ffmpeg", "-y"] + inputs + ["-filter_complex", ";".join(parts), "-map", "[v]", "-map", "[a]",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", "-shortest", "final.mp4"], cwd=OUT)
 
     run(["ffmpeg", "-y", "-i", str(image_files[0]), "-vf",
          "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920", "-frames:v", "1",
@@ -300,8 +508,9 @@ def upload_youtube(video, thumb, data):
         client_id=os.environ["YT_CLIENT_ID"], client_secret=os.environ["YT_CLIENT_SECRET"],
         scopes=["https://www.googleapis.com/auth/youtube.upload"])
     yt = build("youtube", "v3", credentials=creds)
-    desc = (f"{data['description']}\n\nSource: {data['source_text']}\n\n"
-            "#Shorts #Mythology #Hindi #UnseenMythology")
+    desc = (f"{data['description']}\n\nSource: {data['source_text']}\n"
+            "Ye katha granthon aur lok-kathaon par adharit hai.\n\n"
+            "#Shorts #Mythology #Hindi #UnseenMythology #AncientLegends")
     body = {
         "snippet": {"title": f"{data['title'][:88]} #Shorts", "description": desc,
                     "tags": data.get("tags", [])[:15], "categoryId": "24",
@@ -343,17 +552,16 @@ def selftest():
     OUT.mkdir(exist_ok=True)
     scenes = [{"narration_hindi": "यह एक परीक्षण कहानी है जो बहुत पुरानी है और किसी ने नहीं सुनी"},
               {"narration_hindi": "दूसरे दृश्य में रहस्य गहरा होता है और कथा आगे बढ़ती है"},
+              {"narration_hindi": "तीसरे दृश्य में एक पुराना राज़ खुलता है और सब चौंक जाते हैं"},
               {"narration_hindi": "अंत में सच सामने आता है और सब कुछ बदल जाता है"}]
-    voices, images = [], []
-    for i, sc in enumerate(scenes):
-        v = OUT / f"v{i}.mp3"
-        secs = len(sc["narration_hindi"].split()) * 0.4
-        run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency={200 + 60 * i}:duration={secs}", str(v)])
-        voices.append(v)
+    voice = OUT / "voice_raw.mp3"
+    run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=220:duration=16", str(voice)])
+    images = []
+    for i in range(len(scenes)):
         img = OUT / f"img_{i}.png"
         make_gradient(img, i)
         images.append(img)
-    final, thumb = build_video(scenes, voices, images)
+    final, thumb = build_video(scenes, voice, images)
     dur = probe_duration(final)
     info = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                 "stream=width,height", "-of", "csv=p=0", str(final)]).strip()
@@ -368,21 +576,24 @@ def main():
     try:
         used = load_used_topics()
         data = gen_script(used)
-        scenes = data["scenes"][:8]
-        voices, images = [], []
+        scenes = data["scenes"][:12]
+        full_text = " ".join(sc["narration_hindi"].strip() for sc in scenes)
+        voice_raw = OUT / "voice_raw.audio"
+        make_voice(full_text, voice_raw)
+        look = data.get("visual_style", "")
+        images = []
         for i, sc in enumerate(scenes):
-            v = OUT / f"v{i}.mp3"
-            make_voice(sc["narration_hindi"], v)
-            voices.append(v)
             img = OUT / f"img_{i}.png"
-            make_image(sc["image_prompt"], img, i)
+            make_image(f"{sc['image_prompt']} {look}. {STYLE}", img, i)
             images.append(img)
             time.sleep(3)
-        final, thumb = build_video(scenes, voices, images)
+        final, thumb = build_video(scenes, voice_raw, images)
         link = upload_youtube(final, thumb, data)
         upload_facebook(final, data)
         save_row(data["topic"], data["source_text"], data["title"], link, "posted")
-        telegram(f"✅ Short post ho gaya!\n\n{data['title']}\nSource: {data['source_text']}\n{link}")
+        telegram(f"✅ Short post ho gaya!\n\n{data['title']}\nSource: {data['source_text']}\n{link}\n\n"
+                 f"Images: {_STATS['img_ai']} AI, {_STATS['img_reused']} dohraye, {_STATS['img_plain']} saade | "
+                 f"Awaaz: {_STATS['voice_gemini']} Gemini, {_STATS['voice_other']} backup")
     except Exception as e:
         if data:
             save_row(data["topic"], data["source_text"], data["title"], "", "failed")
